@@ -202,6 +202,10 @@ impl InnerWebView {
       w.resize_to_parent()?;
     }
 
+    // Initial commit so the WebView2 renders immediately at the correct size.
+    // Without this, the content only appears after the first WM_SIZE (user resize).
+    unsafe { w.dcomp_device.Commit()? };
+
     Ok(w)
   }
 
