@@ -50,6 +50,7 @@ const PARENT_SUBCLASS_ID: u32 = WM_USER + 0x64;
 const PARENT_DESTROY_MESSAGE: u32 = WM_USER + 0x65;
 const MAIN_THREAD_DISPATCHER_SUBCLASS_ID: u32 = WM_USER + 0x66;
 const INPUT_FORWARDING_SUBCLASS_ID: u32 = WM_USER + 0x67;
+const WM_MOUSELEAVE: u32 = 0x02A3;
 static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| unsafe { RegisterWindowMessageA(s!("Wry::ExecMsg")) });
 
 /// Data passed to the parent window subclass proc via dwrefdata.
@@ -540,7 +541,7 @@ impl InnerWebView {
     // Mouse capture: hold onto events while a button is pressed (e.g. drag outside window)
     match msg {
       WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
-        SetCapture(Some(hwnd));
+        SetCapture(hwnd);
       }
       WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
         let _ = ReleaseCapture();
