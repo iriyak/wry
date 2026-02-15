@@ -463,7 +463,7 @@ impl InnerWebView {
 
       // Bind a composition target to the container HWND
       // topmost=true so the visual tree is on top of any child HWNDs
-      let dcomp_target = dcomp_device.CreateTargetForHwnd(hwnd, true)?;
+      let dcomp_target = dcomp_device.CreateTargetForHwnd(hwnd, false)?;
 
       // Create the root visual that will host the WebView2 content
       let dcomp_root_visual = dcomp_device.CreateVisual()?;
