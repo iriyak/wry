@@ -26,7 +26,14 @@ use windows::{
       Gdi::*,
     },
     System::{Com::*, LibraryLoader::GetModuleHandleW},
-    UI::{Input::KeyboardAndMouse::SetFocus, Shell::*, WindowsAndMessaging::*},
+    UI::{
+      Input::KeyboardAndMouse::{
+        SetCapture, ReleaseCapture, SetFocus,
+        TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE,
+      },
+      Shell::*,
+      WindowsAndMessaging::*,
+    },
   },
 };
 
@@ -42,6 +49,7 @@ type EventRegistrationToken = i64;
 const PARENT_SUBCLASS_ID: u32 = WM_USER + 0x64;
 const PARENT_DESTROY_MESSAGE: u32 = WM_USER + 0x65;
 const MAIN_THREAD_DISPATCHER_SUBCLASS_ID: u32 = WM_USER + 0x66;
+const INPUT_FORWARDING_SUBCLASS_ID: u32 = WM_USER + 0x67;
 static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| unsafe { RegisterWindowMessageA(s!("Wry::ExecMsg")) });
 
 /// Data passed to the parent window subclass proc via dwrefdata.
@@ -89,6 +97,16 @@ pub(crate) struct InnerWebView {
 impl Drop for InnerWebView {
   fn drop(&mut self) {
     let _ = unsafe { self.controller.Close() };
+
+    // Remove input forwarding subclass before destroying the HWND
+    unsafe {
+      let _ = RemoveWindowSubclass(
+        self.hwnd,
+        Some(Self::input_forwarding_subclass_proc),
+        INPUT_FORWARDING_SUBCLASS_ID as _,
+      );
+    }
+
     if self.is_child {
       let _ = unsafe { DestroyWindow(self.hwnd) };
     }
@@ -205,6 +223,11 @@ impl InnerWebView {
     // Initial commit so the WebView2 renders immediately at the correct size.
     // Without this, the content only appears after the first WM_SIZE (user resize).
     unsafe { w.dcomp_device.Commit()? };
+
+    // Install mouse input forwarding subclass on the container HWND.
+    // In composition mode the WebView2 has no child HWND, so mouse events
+    // must be explicitly forwarded via SendMouseInput.
+    unsafe { Self::attach_input_forwarding_subclass(w.hwnd, &w.composition_controller) };
 
     Ok(w)
   }
@@ -450,6 +473,151 @@ impl InnerWebView {
 
       Ok((dcomp_device, dcomp_target, dcomp_root_visual))
     }
+  }
+
+  /// Convert Win32 MK_* mouse key flags to WebView2 virtual key flags.
+  #[inline]
+  fn mouse_virtual_keys(wparam: WPARAM) -> COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS {
+    let mk = wparam.0 as u32;
+    let mut vk = COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE;
+    if mk & 0x0001 != 0 { vk |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_LEFT_BUTTON; }   // MK_LBUTTON
+    if mk & 0x0002 != 0 { vk |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_RIGHT_BUTTON; }  // MK_RBUTTON
+    if mk & 0x0004 != 0 { vk |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_SHIFT; }         // MK_SHIFT
+    if mk & 0x0008 != 0 { vk |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_CONTROL; }       // MK_CONTROL
+    if mk & 0x0010 != 0 { vk |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_MIDDLE_BUTTON; } // MK_MBUTTON
+    if mk & 0x0020 != 0 { vk |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_X_BUTTON1; }     // MK_XBUTTON1
+    if mk & 0x0040 != 0 { vk |= COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_X_BUTTON2; }     // MK_XBUTTON2
+    vk
+  }
+
+  /// Forward a WM_MOUSE* message to the CompositionController via SendMouseInput.
+  #[inline]
+  unsafe fn forward_mouse_input(
+    cc: &ICoreWebView2CompositionController,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    hwnd: HWND,
+  ) {
+    let event_kind = match msg {
+      WM_MOUSEMOVE    => COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE,
+      WM_LBUTTONDOWN  => COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN,
+      WM_LBUTTONUP    => COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
+      WM_LBUTTONDBLCLK => COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOUBLE_CLICK,
+      WM_RBUTTONDOWN  => COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOWN,
+      WM_RBUTTONUP    => COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_UP,
+      WM_RBUTTONDBLCLK => COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOUBLE_CLICK,
+      WM_MBUTTONDOWN  => COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOWN,
+      WM_MBUTTONUP    => COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_UP,
+      WM_MBUTTONDBLCLK => COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOUBLE_CLICK,
+      WM_MOUSEWHEEL   => COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL,
+      WM_MOUSEHWHEEL  => COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL,
+      WM_XBUTTONDOWN  => COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOWN,
+      WM_XBUTTONUP    => COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_UP,
+      WM_XBUTTONDBLCLK => COREWEBVIEW2_MOUSE_EVENT_KIND_X_BUTTON_DOUBLE_CLICK,
+      WM_MOUSELEAVE   => COREWEBVIEW2_MOUSE_EVENT_KIND_LEAVE,
+      _ => return,
+    };
+
+    let virtual_keys = Self::mouse_virtual_keys(wparam);
+
+    // For wheel messages, LPARAM contains screen coordinates; convert to client.
+    // For other messages, LPARAM already has client coordinates (sign-extended).
+    let point = if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
+      let mut pt = POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+      };
+      let _ = ScreenToClient(hwnd, &mut pt);
+      pt
+    } else {
+      POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+      }
+    };
+
+    // Mouse capture: hold onto events while a button is pressed (e.g. drag outside window)
+    match msg {
+      WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
+        SetCapture(Some(hwnd));
+      }
+      WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
+        let _ = ReleaseCapture();
+      }
+      WM_MOUSEMOVE => {
+        // Request WM_MOUSELEAVE so we can send MOUSE_EVENT_KIND_LEAVE to WebView2.
+        // Without this, CSS :hover states get stuck when the mouse leaves the window.
+        let mut tme = TRACKMOUSEEVENT {
+          cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+          dwFlags: TME_LEAVE,
+          hwndTrack: hwnd,
+          dwHoverTime: 0,
+        };
+        let _ = TrackMouseEvent(&mut tme);
+      }
+      _ => {}
+    }
+
+    // For wheel messages, the delta is in the high word of WPARAM
+    let mouse_data = if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL || msg == WM_XBUTTONDOWN || msg == WM_XBUTTONUP || msg == WM_XBUTTONDBLCLK {
+      ((wparam.0 >> 16) & 0xFFFF) as u32
+    } else {
+      0
+    };
+
+    let _ = cc.SendMouseInput(event_kind, virtual_keys, mouse_data, point);
+  }
+
+  /// Subclass procedure on the container HWND that intercepts mouse messages
+  /// and forwards them to the CompositionController.
+  unsafe extern "system" fn input_forwarding_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _uidsubclass: usize,
+    dwrefdata: usize,
+  ) -> LRESULT {
+    match msg {
+      WM_MOUSEMOVE | WM_MOUSELEAVE
+      | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK
+      | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK
+      | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK
+      | WM_MOUSEWHEEL | WM_MOUSEHWHEEL
+      | WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
+        let cc = &*(dwrefdata as *const ICoreWebView2CompositionController);
+        Self::forward_mouse_input(cc, msg, wparam, lparam, hwnd);
+        return LRESULT(0);
+      }
+
+      WM_DESTROY => {
+        // Clean up the boxed CompositionController reference
+        if !(dwrefdata as *mut ()).is_null() {
+          drop(Box::from_raw(dwrefdata as *mut ICoreWebView2CompositionController));
+        }
+      }
+
+      _ => {}
+    }
+
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+  }
+
+  /// Install a subclass on the container HWND to forward mouse input
+  /// to the CompositionController via SendMouseInput.
+  #[inline]
+  unsafe fn attach_input_forwarding_subclass(
+    hwnd: HWND,
+    composition_controller: &ICoreWebView2CompositionController,
+  ) {
+    let cc = Box::new(composition_controller.clone());
+    let _ = SetWindowSubclass(
+      hwnd,
+      Some(Self::input_forwarding_subclass_proc),
+      INPUT_FORWARDING_SUBCLASS_ID as _,
+      Box::into_raw(cc) as _,
+    );
   }
 
   #[inline]
