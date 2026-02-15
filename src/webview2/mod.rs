@@ -598,7 +598,7 @@ impl InnerWebView {
           let cc = &*(dwrefdata as *const ICoreWebView2CompositionController);
           let mut cursor = HCURSOR::default();
           if cc.Cursor(&mut cursor).is_ok() {
-            SetCursor(cursor);
+            SetCursor(Some(cursor));
             return LRESULT(1); // handled
           }
         }
