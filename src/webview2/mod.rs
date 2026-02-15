@@ -20,7 +20,11 @@ use windows::{
   Win32::{
     Foundation::*,
     Globalization::*,
-    Graphics::Gdi::*,
+    Graphics::{
+      DirectComposition::{DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual},
+      Dxgi::IDXGIDevice,
+      Gdi::*,
+    },
     System::{Com::*, LibraryLoader::GetModuleHandleW},
     UI::{Input::KeyboardAndMouse::SetFocus, Shell::*, WindowsAndMessaging::*},
   },
@@ -58,8 +62,17 @@ pub(crate) struct InnerWebView {
   hwnd: HWND,
   is_child: bool,
   pub controller: ICoreWebView2Controller,
+  composition_controller: ICoreWebView2CompositionController,
   webview: ICoreWebView2,
   env: ICoreWebView2Environment,
+  // DirectComposition objects for visual-hosted WebView2 (airspace fix).
+  // These must be kept alive for the lifetime of the WebView.
+  #[allow(dead_code)]
+  dcomp_device: IDCompositionDevice,
+  #[allow(dead_code)]
+  dcomp_target: IDCompositionTarget,
+  #[allow(dead_code)]
+  dcomp_root_visual: IDCompositionVisual,
   // Store FileDropController in here to make sure it gets dropped when
   // the webview gets dropped, otherwise we'll have a memory leak
   #[allow(dead_code)]
@@ -124,7 +137,21 @@ impl InnerWebView {
       .unwrap_or_else(|| (hwnd.0 as isize).to_string());
 
     let env = Self::create_environment(&attributes, pl_attrs.clone())?;
-    let controller = Self::create_controller(hwnd, &env, attributes.incognito)?;
+
+    // Step 1: Create DirectComposition visual tree bound to the container HWND
+    let (dcomp_device, dcomp_target, dcomp_root_visual) = Self::create_dcomp_visual_tree(hwnd)?;
+
+    // Step 2: Create a CompositionController (visual-hosted, no child HWND)
+    let composition_controller = Self::create_composition_controller(hwnd, &env, attributes.incognito)?;
+
+    // Step 3: Connect the WebView2 rendering output to the DComp visual
+    unsafe {
+      composition_controller.SetRootVisualTarget(&dcomp_root_visual)?;
+    }
+
+    // Step 4: Cast to ICoreWebView2Controller for compatibility with the rest of the code
+    let controller: ICoreWebView2Controller = composition_controller.cast()?;
+
     let webview = Self::init_webview(
       parent,
       hwnd,
@@ -151,9 +178,13 @@ impl InnerWebView {
       parent: RefCell::new(parent),
       hwnd,
       controller,
+      composition_controller,
       is_child,
       webview,
       env,
+      dcomp_device,
+      dcomp_target,
+      dcomp_root_visual,
       drag_drop_controller,
     };
 
@@ -351,19 +382,17 @@ impl InnerWebView {
   }
 
   #[inline]
-  fn create_controller(
+  fn create_composition_controller(
     hwnd: HWND,
     env: &ICoreWebView2Environment,
     incognito: bool,
-  ) -> Result<ICoreWebView2Controller> {
+  ) -> Result<ICoreWebView2CompositionController> {
     let (tx, rx) = mpsc::channel();
     let env = env.clone();
     let env10 = env.cast::<ICoreWebView2Environment10>();
 
     // Use CompositionController handler to create a visual-hosted WebView2
     // instead of an HWND-hosted one (airspace fix).
-    // The callback receives ICoreWebView2CompositionController, which
-    // implements ICoreWebView2Controller via COM inheritance.
     let handler = CreateCoreWebView2CompositionControllerCompletedHandler::create(Box::new(
       move |error_code, controller| {
         error_code?;
@@ -384,11 +413,31 @@ impl InnerWebView {
       }
     }
 
-    // The channel receives ICoreWebView2CompositionController.
-    // Cast it to ICoreWebView2Controller so the rest of the code is unchanged.
     let composition_controller = webview2_com::wait_with_pump(rx)??;
-    let controller: ICoreWebView2Controller = composition_controller.cast()?;
-    Ok(controller)
+    Ok(composition_controller)
+  }
+
+  /// Create a DirectComposition visual tree bound to the given HWND.
+  /// Returns (device, target, root_visual) which must be kept alive.
+  #[inline]
+  fn create_dcomp_visual_tree(hwnd: HWND) -> Result<(IDCompositionDevice, IDCompositionTarget, IDCompositionVisual)> {
+    unsafe {
+      // Create a software-only DirectComposition device (no IDXGIDevice needed)
+      let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(None::<&IDXGIDevice>)?;
+
+      // Bind a composition target to the container HWND
+      // topmost=true so the visual tree is on top of any child HWNDs
+      let dcomp_target = dcomp_device.CreateTargetForHwnd(hwnd, true)?;
+
+      // Create the root visual that will host the WebView2 content
+      let dcomp_root_visual = dcomp_device.CreateVisual()?;
+
+      // Attach the visual to the target and commit
+      dcomp_target.SetRoot(&dcomp_root_visual)?;
+      dcomp_device.Commit()?;
+
+      Ok((dcomp_device, dcomp_target, dcomp_root_visual))
+    }
   }
 
   #[inline]
