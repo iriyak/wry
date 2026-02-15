@@ -44,6 +44,13 @@ const PARENT_DESTROY_MESSAGE: u32 = WM_USER + 0x65;
 const MAIN_THREAD_DISPATCHER_SUBCLASS_ID: u32 = WM_USER + 0x66;
 static EXEC_MSG_ID: Lazy<u32> = Lazy::new(|| unsafe { RegisterWindowMessageA(s!("Wry::ExecMsg")) });
 
+/// Data passed to the parent window subclass proc via dwrefdata.
+/// Holds the controller for resize/focus and the DComp device for Commit().
+struct ParentSubclassData {
+  controller: ICoreWebView2Controller,
+  dcomp_device: IDCompositionDevice,
+}
+
 impl From<webview2_com::Error> for Error {
   fn from(err: webview2_com::Error) -> Self {
     Error::WebView2Error(err)
@@ -159,6 +166,7 @@ impl InnerWebView {
       attributes,
       &env,
       &controller,
+      &dcomp_device,
       pl_attrs,
       is_child,
     )?;
@@ -448,6 +456,7 @@ impl InnerWebView {
     mut attributes: WebViewAttributes,
     env: &ICoreWebView2Environment,
     controller: &ICoreWebView2Controller,
+    dcomp_device: &IDCompositionDevice,
     pl_attrs: super::PlatformSpecificWebViewAttributes,
     is_child: bool,
   ) -> Result<ICoreWebView2> {
@@ -567,7 +576,7 @@ impl InnerWebView {
 
     // Subclass parent for resizing and focus
     if !is_child {
-      unsafe { Self::attach_parent_subclass(parent, controller) };
+      unsafe { Self::attach_parent_subclass(parent, controller, dcomp_device) };
     }
 
     unsafe {
@@ -1183,21 +1192,25 @@ impl InnerWebView {
     match msg {
       WM_SIZE => {
         if wparam.0 != SIZE_MINIMIZED as usize {
-          let controller = dwrefdata as *mut ICoreWebView2Controller;
+          let data = dwrefdata as *mut ParentSubclassData;
 
           let Ok(PhysicalSize { width, height }) = Self::parent_bounds(hwnd) else {
             return DefSubclassProc(hwnd, msg, wparam, lparam);
           };
 
-          let _ = (*controller).SetBounds(RECT {
+          let _ = (*data).controller.SetBounds(RECT {
             left: 0,
             top: 0,
             right: width,
             bottom: height,
           });
 
+          // In composition mode, the visual tree must be committed after
+          // bounds change for the WebView2 to re-render at the new size.
+          let _ = (*data).dcomp_device.Commit();
+
           let mut hwnd = HWND::default();
-          if (*controller).ParentWindow(&mut hwnd).is_ok() {
+          if (*data).controller.ParentWindow(&mut hwnd).is_ok() {
             let _ = SetWindowPos(
               hwnd,
               None,
@@ -1212,21 +1225,21 @@ impl InnerWebView {
       }
 
       WM_SETFOCUS | WM_ENTERSIZEMOVE => {
-        let controller = dwrefdata as *mut ICoreWebView2Controller;
-        let _ = (*controller).MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+        let data = dwrefdata as *mut ParentSubclassData;
+        let _ = (*data).controller.MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
       }
 
       msg if msg == WM_MOVE || msg == WM_MOVING => {
-        let controller = dwrefdata as *mut ICoreWebView2Controller;
-        let _ = (*controller).NotifyParentWindowPositionChanged();
+        let data = dwrefdata as *mut ParentSubclassData;
+        let _ = (*data).controller.NotifyParentWindowPositionChanged();
       }
 
       msg if msg == WM_DESTROY || msg == PARENT_DESTROY_MESSAGE => {
-        // check if `dwrefdata` is null to avoid double-freeing the controller
+        // check if `dwrefdata` is null to avoid double-freeing
         if !(dwrefdata as *mut ()).is_null() {
-          drop(Box::from_raw(dwrefdata as *mut ICoreWebView2Controller));
+          drop(Box::from_raw(dwrefdata as *mut ParentSubclassData));
 
-          // update `dwrefdata` to null to avoid double-freeing the controller
+          // update `dwrefdata` to null to avoid double-freeing
           let _ = SetWindowSubclass(
             hwnd,
             Some(Self::parent_subclass_proc),
@@ -1243,12 +1256,20 @@ impl InnerWebView {
   }
 
   #[inline]
-  unsafe fn attach_parent_subclass(parent: HWND, controller: &ICoreWebView2Controller) {
+  unsafe fn attach_parent_subclass(
+    parent: HWND,
+    controller: &ICoreWebView2Controller,
+    dcomp_device: &IDCompositionDevice,
+  ) {
+    let data = Box::new(ParentSubclassData {
+      controller: controller.clone(),
+      dcomp_device: dcomp_device.clone(),
+    });
     let _ = SetWindowSubclass(
       parent,
       Some(Self::parent_subclass_proc),
       PARENT_SUBCLASS_ID as _,
-      Box::into_raw(Box::new(controller.clone())) as _,
+      Box::into_raw(data) as _,
     );
   }
 
@@ -1584,7 +1605,7 @@ impl InnerWebView {
 
       if !self.is_child {
         Self::dettach_parent_subclass(*self.parent.borrow());
-        Self::attach_parent_subclass(parent, &self.controller);
+        Self::attach_parent_subclass(parent, &self.controller, &self.dcomp_device);
 
         *self.parent.borrow_mut() = parent;
 
