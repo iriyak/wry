@@ -360,10 +360,11 @@ impl InnerWebView {
     let env = env.clone();
     let env10 = env.cast::<ICoreWebView2Environment10>();
 
-    // we don't use CreateCoreWebView2ControllerCompletedHandler::wait_for_async
-    // as it uses an mspc::channel under the hood, so we can avoid using two channels
-    // by manually creating the callback handler and use webview2_com::with_with_bump
-    let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
+    // Use CompositionController handler to create a visual-hosted WebView2
+    // instead of an HWND-hosted one (airspace fix).
+    // The callback receives ICoreWebView2CompositionController, which
+    // implements ICoreWebView2Controller via COM inheritance.
+    let handler = CreateCoreWebView2CompositionControllerCompletedHandler::create(Box::new(
       move |error_code, controller| {
         error_code?;
         tx.send(controller.ok_or_else(|| windows::core::Error::from(E_POINTER)))
@@ -375,13 +376,19 @@ impl InnerWebView {
       if let Ok(env10) = env10 {
         let controller_opts = env10.CreateCoreWebView2ControllerOptions()?;
         controller_opts.SetIsInPrivateModeEnabled(incognito)?;
-        env10.CreateCoreWebView2ControllerWithOptions(hwnd, &controller_opts, &handler)?;
+        env10.CreateCoreWebView2CompositionControllerWithOptions(hwnd, &controller_opts, &handler)?;
       } else {
-        env.CreateCoreWebView2Controller(hwnd, &handler)?
+        // Fallback for older Runtime: use ICoreWebView2Environment3
+        let env3: ICoreWebView2Environment3 = env.cast()?;
+        env3.CreateCoreWebView2CompositionController(hwnd, &handler)?;
       }
     }
 
-    webview2_com::wait_with_pump(rx)?.map_err(Into::into)
+    // The channel receives ICoreWebView2CompositionController.
+    // Cast it to ICoreWebView2Controller so the rest of the code is unchanged.
+    let composition_controller = webview2_com::wait_with_pump(rx)??;
+    let controller: ICoreWebView2Controller = composition_controller.cast()?;
+    Ok(controller)
   }
 
   #[inline]
