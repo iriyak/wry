@@ -592,6 +592,18 @@ impl InnerWebView {
         return LRESULT(0);
       }
 
+      WM_SETCURSOR => {
+        // LOWORD(lparam) == HTCLIENT(1): cursor is in the client area
+        if (lparam.0 & 0xFFFF) as u16 == 1 {
+          let cc = &*(dwrefdata as *const ICoreWebView2CompositionController);
+          let mut cursor = HCURSOR::default();
+          if cc.Cursor(&mut cursor).is_ok() {
+            SetCursor(cursor);
+            return LRESULT(1); // handled
+          }
+        }
+      }
+
       WM_DESTROY => {
         // Clean up the boxed CompositionController reference
         if !(dwrefdata as *mut ()).is_null() {
